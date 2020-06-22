@@ -21,6 +21,15 @@ use std::collections::HashMap;
 use std::mem;
 use target_lexicon::PointerWidth;
 
+#[cfg(feature = "unwind")]
+use cranelift_codegen::isa::unwind::UnwindInfo;
+#[cfg(feature = "unwind")]
+use cranelift_codegen::CodegenError;
+#[cfg(feature = "unwind")]
+use cranelift_module::ModuleError;
+#[cfg(feature = "unwind")]
+use gimli::write::Address;
+
 /// A builder for `ObjectBackend`.
 pub struct ObjectBuilder {
     isa: Box<dyn TargetIsa>,
@@ -307,10 +316,6 @@ impl Backend for ObjectBackend {
 
         #[cfg(feature = "unwind")]
         {
-            use cranelift_codegen::isa::unwind::UnwindInfo;
-            use cranelift_module::ModuleError;
-            use cranelift_codegen::CodegenError;
-            use gimli::write::Address;
             let unwind_info = ctx
                 .create_unwind_info(self.isa())
                 .map_err(|err| ModuleError::Compilation(err))?;
@@ -538,19 +543,31 @@ impl Backend for ObjectBackend {
                 .map_err(|e| cranelift_module::ModuleError::Backend(anyhow!(e)))?;
             let eh_frame_bytes = eh_frame.0.data;
 
-            if self.object.format() == BinaryFormat::Elf {
-                eh_frame_ctx.set_segment_section(".eh_frame", ".eh_frame");
-                eh_frame_ctx.define(eh_frame_bytes.into_boxed_slice());
+            let section_name = match self.object.format() {
+                BinaryFormat::Elf => ".eh_frame".as_bytes().to_vec(),
+                BinaryFormat::Macho => "__eh_frame".as_bytes().to_vec(),
+                objfmt => {
+                    return Err(ModuleError::Compilation(CodegenError::Unsupported(
+                        format!(
+                            "cranelift-object does not yet support consolidating \
+                            {} unwind information.",
+                            objfmt
+                        ),
+                    )));
+                }
+            };
 
-                let dataid = self.declare_data(
-                    ".eh_frame",
-                    Linkage::Local,
-                    false,
-                    false,
-                    None
-                )?;
-                self.define_data(section_dataid, eh_frame_ctx)?;
-            }
+            eh_frame_ctx.set_segment_section("", &eh_section_name);
+            eh_frame_ctx.define(eh_frame_bytes.into_boxed_slice());
+
+            let dataid = self.declare_data(
+                &eh_section_name,
+                Linkage::Local,
+                false,
+                false,
+                None
+            )?;
+            self.define_data(section_dataid, eh_frame_ctx)?;
         }
 
         let mut symbol_relocs = Vec::new();
