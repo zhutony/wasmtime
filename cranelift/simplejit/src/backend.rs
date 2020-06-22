@@ -555,8 +555,8 @@ impl<'simple_jit_backend> Backend for SimpleJITBackend {
     ///
     /// This method does not need to be called when access to the memory
     /// handle is not required.
-    fn finish(self, _namespace: &ModuleNamespace<Self>) -> Self::Product {
-        self.memory
+    fn finish(self, _namespace: &ModuleNamespace<Self>) -> ModuleResult<Self::Product> {
+        Ok(self.memory)
     }
 }
 

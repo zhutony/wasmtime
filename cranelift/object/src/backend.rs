@@ -106,6 +106,57 @@ pub struct ObjectBackend {
     libcalls: HashMap<ir::LibCall, SymbolId>,
     libcall_names: Box<dyn Fn(ir::LibCall) -> String>,
     function_alignment: u64,
+    #[cfg(feature = "unwind")]
+    frame_table: gimli::write::FrameTable,
+    #[cfg(feature = "unwind")]
+    cie_id: gimli::write::CieId,
+}
+
+impl ObjectBackend {
+    fn add_relocations(&mut self, section: SectionId, offset: u64, data_desc: &DataDescription) {
+        let &DataDescription {
+            ref function_decls,
+            ref data_decls,
+            ref function_relocs,
+            ref data_relocs,
+            ..
+        } = data_desc;
+
+        let reloc_size = match self.isa.triple().pointer_width().unwrap() {
+            PointerWidth::U16 => 16,
+            PointerWidth::U32 => 32,
+            PointerWidth::U64 => 64,
+        };
+        let mut relocs = Vec::new();
+        for &(offset, id) in function_relocs {
+            relocs.push(RelocRecord {
+                offset,
+                name: function_decls[id].clone(),
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: reloc_size,
+                addend: 0,
+            });
+        }
+        for &(offset, id, addend) in data_relocs {
+            relocs.push(RelocRecord {
+                offset,
+                name: data_decls[id].clone(),
+                kind: RelocationKind::Absolute,
+                encoding: RelocationEncoding::Generic,
+                size: reloc_size,
+                addend,
+            });
+        }
+
+        if !relocs.is_empty() {
+            self.relocs.push(SymbolRelocs {
+                section,
+                offset,
+                relocs,
+            });
+        }
+    }
 }
 
 impl Backend for ObjectBackend {
@@ -125,6 +176,18 @@ impl Backend for ObjectBackend {
     fn new(builder: ObjectBuilder) -> Self {
         let mut object = Object::new(builder.binary_format, builder.architecture, builder.endian);
         object.add_file_symbol(builder.name);
+
+        #[cfg(feature = "unwind")]
+        let mut frame_table = gimli::write::FrameTable::default();
+        #[cfg(feature = "unwind")]
+        let cie_id = frame_table.add_cie(
+            builder
+                .isa
+                .as_ref()
+                .create_systemv_cie()
+                .expect("creating a SystemV CIE does not fail"),
+        );
+
         Self {
             isa: builder.isa,
             object,
@@ -134,6 +197,10 @@ impl Backend for ObjectBackend {
             libcalls: HashMap::new(),
             libcall_names: builder.libcall_names,
             function_alignment: builder.function_alignment,
+            #[cfg(feature = "unwind")]
+            frame_table,
+            #[cfg(feature = "unwind")]
+            cie_id,
         }
     }
 
@@ -237,6 +304,53 @@ impl Backend for ObjectBackend {
                 relocs: reloc_sink.relocs,
             });
         }
+
+        #[cfg(feature = "unwind")]
+        {
+            use cranelift_codegen::isa::unwind::UnwindInfo;
+            use cranelift_module::ModuleError;
+            use cranelift_codegen::CodegenError;
+            use gimli::write::Address;
+            let unwind_info = ctx
+                .create_unwind_info(self.isa())
+                .map_err(|err| ModuleError::Compilation(err))?;
+            if let Some(unwind_info) = unwind_info {
+                match self.object.format() {
+                    BinaryFormat::Elf | BinaryFormat::Macho => {
+                        if let UnwindInfo::SystemV(info) = unwind_info {
+                            self.frame_table.add_fde(
+                                self.cie_id,
+                                info.to_fde(Address::Symbol {
+                                    symbol: func_id.as_u32() as usize,
+                                    addend: 0,
+                                }),
+                            );
+                        } else {
+                            return Err(ModuleError::Compilation(CodegenError::Unsupported(
+                                "Windows x64 unwind information in ELF/MachO output.".to_string(),
+                            )));
+                        }
+                    }
+                    objfmt => {
+                        return Err(ModuleError::Compilation(CodegenError::Unsupported(
+                            format!(
+                                "cranelift-object does not yet support consolidating \
+                            {} unwind information.",
+                                objfmt
+                            ),
+                        )));
+                    }
+                }
+            } else {
+                return Err(ModuleError::Compilation(CodegenError::Unsupported(
+                    format!(
+                        "cranelift-object does not yet support consolidated unwind \
+                    information where some functions have no unwind information."
+                    ),
+                )));
+            }
+        }
+
         Ok(ObjectCompiledFunction)
     }
 
@@ -337,6 +451,8 @@ impl Backend for ObjectBackend {
             )
         };
 
+        let symbol = self.data_objects[data_id].unwrap();
+
         let align = u64::from(align.unwrap_or(1));
         let offset = match *init {
             Init::Uninitialized => {
@@ -349,13 +465,9 @@ impl Backend for ObjectBackend {
                 .object
                 .add_symbol_data(symbol, section, &contents, align),
         };
-        if !relocs.is_empty() {
-            self.relocs.push(SymbolRelocs {
-                section,
-                offset,
-                relocs,
-            });
-        }
+
+        self.add_relocations(section, offset, data_ctx.description());
+
         Ok(ObjectCompiledData)
     }
 
@@ -408,7 +520,39 @@ impl Backend for ObjectBackend {
         // Nothing to do.
     }
 
-    fn finish(mut self, namespace: &ModuleNamespace<Self>) -> ObjectProduct {
+    fn finish(mut self, namespace: &ModuleNamespace<Self>) -> ModuleResult<ObjectProduct> {
+        #[cfg(feature = "unwind")]
+        {
+            use crate::unwind::EhFrameSink;
+            use anyhow::anyhow;
+            use gimli::write::EhFrame;
+            let mut eh_frame_ctx = cranelift_module::DataContext::new();
+
+            let mut eh_frame = EhFrame(EhFrameSink {
+                data: Vec::new(),
+                data_context: &mut eh_frame_ctx,
+                object: &self,
+            });
+            self.frame_table
+                .write_eh_frame(&mut eh_frame)
+                .map_err(|e| cranelift_module::ModuleError::Backend(anyhow!(e)))?;
+            let eh_frame_bytes = eh_frame.0.data;
+
+            if self.object.format() == BinaryFormat::Elf {
+                eh_frame_ctx.set_segment_section(".eh_frame", ".eh_frame");
+                eh_frame_ctx.define(eh_frame_bytes.into_boxed_slice());
+
+                let dataid = self.declare_data(
+                    ".eh_frame",
+                    Linkage::Local,
+                    false,
+                    false,
+                    None
+                )?;
+                self.define_data(section_dataid, eh_frame_ctx)?;
+            }
+        }
+
         let mut symbol_relocs = Vec::new();
         mem::swap(&mut symbol_relocs, &mut self.relocs);
         for symbol in symbol_relocs {
@@ -447,11 +591,11 @@ impl Backend for ObjectBackend {
             );
         }
 
-        ObjectProduct {
+        Ok(ObjectProduct {
             object: self.object,
             functions: self.functions,
             data_objects: self.data_objects,
-        }
+        })
     }
 }
 

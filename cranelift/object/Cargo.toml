@@ -10,11 +10,15 @@ readme = "README.md"
 edition = "2018"
 
 [dependencies]
+anyhow = "1.0"
 cranelift-module = { path = "../module", version = "0.65.0" }
 cranelift-codegen = { path = "../codegen", version = "0.65.0", default-features = false, features = ["std"] }
 object = { version = "0.19", default-features = false, features = ["write"] }
+gimli = { version = "0.21", default-features = false, features = ["write"], optional = true }
 target-lexicon = "0.10"
-anyhow = "1.0"
 
 [badges]
 maintenance = { status = "experimental" }
+
+[features]
+unwind = ["gimli", "cranelift-codegen/unwind"]

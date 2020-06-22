@@ -171,7 +171,7 @@ where
 
     /// Consume this `Backend` and return a result. Some implementations may
     /// provide additional functionality through this result.
-    fn finish(self, namespace: &ModuleNamespace<Self>) -> Self::Product;
+    fn finish(self, namespace: &ModuleNamespace<Self>) -> ModuleResult<Self::Product>;
 }
 
 /// Default names for `ir::LibCall`s. A function by this name is imported into the object as

@@ -497,6 +497,7 @@ dependencies = [
  "anyhow",
  "cranelift-codegen",
  "cranelift-module",
+ "gimli",
  "object 0.19.0",
  "target-lexicon",
 ]

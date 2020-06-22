@@ -26,6 +26,8 @@
 )]
 
 mod backend;
+#[cfg(feature = "unwind")]
+mod unwind;
 
 pub use crate::backend::{ObjectBackend, ObjectBuilder, ObjectProduct};
 

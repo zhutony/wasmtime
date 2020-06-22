@@ -315,10 +315,10 @@ impl Backend for FaerieBackend {
         // Nothing to do.
     }
 
-    fn finish(self, _namespace: &ModuleNamespace<Self>) -> FaerieProduct {
-        FaerieProduct {
+    fn finish(self, _namespace: &ModuleNamespace<Self>) -> ModuleResult<FaerieProduct> {
+        Ok(FaerieProduct {
             artifact: self.artifact,
-        }
+        })
     }
 }
 
